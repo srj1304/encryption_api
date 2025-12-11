@@ -32,7 +32,7 @@ Stateless architecture
 •
 🛠 SETUP INSTRUCTIONS
 CLONE REPO
-git clone https://github.com/YOUR_USERNAME/pii-vault.git
+git clone https://github.com/srj1304/encryption_api
 INSTALL DEPENDENCIES
 pip install -r requirements.txt
 CONFIGURE .ENV
