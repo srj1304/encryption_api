@@ -1,0 +1,345 @@
+package main
+
+import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"log"
+	mrand "math/rand"
+	"net/http"
+	"os"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	_ "github.com/go-sql-driver/mysql"
+)
+
+
+// ======================================================
+// PROMETHEUS METRICS
+// ======================================================
+
+var (
+
+	encryptRequests = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "pii_encrypt_requests_total",
+			Help: "Total encrypt requests",
+		})
+
+	encryptSuccess = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "pii_encrypt_success_total",
+			Help: "Total encrypt success",
+		})
+
+	encryptFailure = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "pii_encrypt_failure_total",
+			Help: "Total encrypt failure",
+		})
+
+	decryptRequests = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "pii_decrypt_requests_total",
+			Help: "Total decrypt requests",
+		})
+
+	cacheHit = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "pii_cache_hit_total",
+			Help: "Cache hit",
+		})
+
+	cacheMiss = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "pii_cache_miss_total",
+			Help: "Cache miss",
+		})
+
+	requestLatency = prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "pii_request_latency_seconds",
+			Help:    "Request latency",
+			Buckets: prometheus.DefBuckets,
+		})
+)
+
+func init() {
+	prometheus.MustRegister(
+		encryptRequests,
+		encryptSuccess,
+		encryptFailure,
+		decryptRequests,
+		cacheHit,
+		cacheMiss,
+		requestLatency,
+	)
+}
+
+
+// ======================================================
+// CACHE
+// ======================================================
+
+var CACHE = map[string]string{}
+var CACHE_META = map[string]time.Time{}
+var CACHE_LOCK sync.RWMutex
+
+func cacheGet(prefix, key string) (string, bool) {
+
+	CACHE_LOCK.RLock()
+	defer CACHE_LOCK.RUnlock()
+
+	k := prefix + "::" + key
+
+	val, ok := CACHE[k]
+
+	if !ok {
+		cacheMiss.Inc()
+		return "", false
+	}
+
+	if time.Since(CACHE_META[k]) > 300*time.Second {
+		cacheMiss.Inc()
+		return "", false
+	}
+
+	cacheHit.Inc()
+	return val, true
+}
+
+func cacheSet(prefix, key, val string) {
+
+	CACHE_LOCK.Lock()
+	defer CACHE_LOCK.Unlock()
+
+	k := prefix + "::" + key
+	CACHE[k] = val
+	CACHE_META[k] = time.Now()
+}
+
+
+// ======================================================
+// MASTER KEYS
+// ======================================================
+
+var MASTER_KEYS = map[string][]byte{
+	"K01": mustHex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+	"K02": mustHex("a54ff53a6b1db8bf62a27db8228b9e47379b24b977b391a29fb1045db99f057e"),
+}
+
+func mustHex(s string) []byte {
+	b, _ := hex.DecodeString(s)
+	return b
+}
+
+func chooseMasterKey() (string, []byte) {
+
+	keys := []string{"K01", "K02"}
+	k := keys[mrand.Intn(len(keys))]
+
+	return k, MASTER_KEYS[k]
+}
+
+
+// ======================================================
+// CRYPTO
+// ======================================================
+
+func sha256Key(v string) string {
+	hash := sha256.Sum256([]byte(v))
+	return hex.EncodeToString(hash[:])
+}
+
+func encryptValue(value string) (string, string, string) {
+
+	dek := make([]byte, 32)
+	rand.Read(dek)
+
+	block, _ := aes.NewCipher(dek)
+
+	iv := make([]byte, block.BlockSize())
+	rand.Read(iv)
+
+	mode := cipher.NewCBCEncrypter(block, iv)
+
+	padded := pkcs7Pad([]byte(value), block.BlockSize())
+	ciphertext := make([]byte, len(padded))
+	mode.CryptBlocks(ciphertext, padded)
+
+	kid, master := chooseMasterKey()
+
+	keyBlock, _ := aes.NewCipher(master)
+	keyEnc := cipher.NewECBEncrypter(keyBlock)
+
+	keyEncData := make([]byte, len(pkcs7Pad(dek, 16)))
+	keyEnc.CryptBlocks(keyEncData, pkcs7Pad(dek, 16))
+
+	return kid,
+		base64.StdEncoding.EncodeToString(append(iv, ciphertext...)),
+		base64.StdEncoding.EncodeToString(keyEncData)
+}
+
+
+// ======================================================
+// WORKER
+// ======================================================
+
+type EncryptJob struct {
+	Value  string
+	Result chan map[string]string
+}
+
+var encryptQueue = make(chan EncryptJob, 10000)
+
+func encryptWorker(db *sql.DB) {
+
+	for job := range encryptQueue {
+
+		pk := sha256Key(job.Value)
+
+		if val, ok := cacheGet("enc", job.Value); ok {
+
+			job.Result <- map[string]string{
+				"pii_key": val,
+				"status":  "cache_hit",
+			}
+
+			continue
+		}
+
+		kid, enc, encKey := encryptValue(job.Value)
+
+		_, err := db.Exec(
+			"INSERT IGNORE INTO pii_vault (pii_key, encrypt_data, encrypt_key, key_id)",
+			pk, enc, encKey, kid,
+		)
+
+		if err != nil {
+
+			encryptFailure.Inc()
+
+			job.Result <- map[string]string{
+				"status": "error",
+			}
+
+			continue
+		}
+
+		cacheSet("enc", job.Value, pk)
+
+		encryptSuccess.Inc()
+
+		job.Result <- map[string]string{
+			"pii_key": pk,
+			"status":  "success",
+		}
+	}
+}
+
+
+// ======================================================
+// API
+// ======================================================
+
+func encryptHandler(db *sql.DB) http.HandlerFunc {
+
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		start := time.Now()
+
+		encryptRequests.Inc()
+
+		defer func() {
+			requestLatency.Observe(time.Since(start).Seconds())
+		}()
+
+		var req struct {
+			Values []string `json:"values"`
+		}
+
+		json.NewDecoder(r.Body).Decode(&req)
+
+		var results []map[string]string
+
+		for _, v := range req.Values {
+
+			ch := make(chan map[string]string)
+
+			encryptQueue <- EncryptJob{
+				Value:  v,
+				Result: ch,
+			}
+
+			res := <-ch
+
+			results = append(results, res)
+		}
+
+		json.NewEncoder(w).Encode(results)
+	}
+}
+
+
+// ======================================================
+// MAIN
+// ======================================================
+
+func main() {
+
+	dsn := fmt.Sprintf(
+		"%s:%s@tcp(%s)/%s",
+		os.Getenv("DB_USER"),
+		os.Getenv("DB_PASS"),
+		os.Getenv("DB_HOST"),
+		os.Getenv("DB_NAME"),
+	)
+
+	db, err := sql.Open("mysql", dsn)
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	for i := 0; i < 40; i++ {
+		go encryptWorker(db)
+	}
+
+	http.HandleFunc("/encrypt", encryptHandler(db))
+
+	http.Handle("/metrics", promhttp.Handler())
+
+	log.Println("PII Vault Started")
+
+	http.ListenAndServe(":5000", nil)
+}
+
+
+// ======================================================
+// PADDING
+// ======================================================
+
+func pkcs7Pad(data []byte, blocklen int) []byte {
+	padlen := blocklen - len(data)%blocklen
+	pad := bytesRepeat(byte(padlen), padlen)
+	return append(data, pad...)
+}
+
+func bytesRepeat(b byte, count int) []byte {
+	buf := make([]byte, count)
+	for i := range buf {
+		buf[i] = b
+	}
+	return buf
+}
